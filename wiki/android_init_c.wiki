@@ -1,0 +1,409 @@
+#labels android,init
+android的init过程分析
+ http://blog.csdn.net/windskier/archive/2011/05/13/6416547.aspx
+
+原创  android的init过程分析 收藏
+
+前言
+Android系统是运作在linux kernal上的，因此它的启动过程也遵循linux的启动过程，当linux内核启动之后，运行的第一个进程是init，这个进程是一个守护进程，它的生命周期贯穿整个linux 内核运行的始终， linux中所有其他的进程的共同始祖均为init进程。当然为了启动并运行整个android系统，google实现了自己的init进程，下面主要分析init进程都做了些什么？
+
+1.首先，init是一个守护进程，为了防止init的子进程成为僵尸进程(zombie process)，需要init在子进程在结束时获取子进程的结束码，通过结束码将程序表中的子进程移除，防止成为僵尸进程的子进程占用程序表的空间，当程序表的空间达到上限时，则系统就不能再启动新的进程了，那么就会引起很严重的系统问题。
+    在linux当中，父程序是通过捕捉SIGCHLD信号来得知子进程结束的情况的；由于系统默认在子进程暂停时也会发送信号SIGCHLD，init需要忽略子进程在暂停时发出的SIGCHLD信号，因此将act.sa_flags 置为SA_NOCLDSTOP，该标志位的含义是就是要求系统在子进程暂停时不发送SIGCHLD信号。具体的代码如下所示：
+    struct sigaction act;
+    ………………
+    act.sa_handler = sigchld_handler;
+    act.sa_flags = SA_NOCLDSTOP;
+    act.sa_mask = 0;
+    act.sa_restorer = NULL;
+    sigaction(SIGCHLD, &act, 0);
+
+2.创建文件系统目录并挂载相关的文件系统
+
+    /* clear the umask */
+    umask(0);
+
+        /* Get the basic filesystem setup we need put
+         * together in the initramdisk on / and then we'll
+         * let the rc file figure out the rest.
+         */
+    mkdir("/dev", 0755);
+    mkdir("/proc", 0755);
+    mkdir("/sys", 0755);
+
+    mount("tmpfs", "/dev", "tmpfs", 0, "mode=0755");
+    mkdir("/dev/pts", 0755);
+    mkdir("/dev/socket", 0755);
+    mount("devpts", "/dev/pts", "devpts", 0, NULL);
+    mount("proc", "/proc", "proc", 0, NULL);
+    mount("sysfs", "/sys", "sysfs", 0, NULL);
+
+2.1 清除屏蔽字(file mode creation mask)，保证新建的目录的访问权限不受屏蔽字影响.
+
+2.2 在init初始化过程中，Android分别挂载了tmpfs，devpts，proc，sysfs 4类文件系统
+
+2.2.1 tmpfs文件系统
+    tmpfs是一种虚拟内存文件系统，因此它会将所有的文件存储在虚拟内存中，并且tmpfs下的所有内容均为临时性的内容，如果你将tmpfs文件系统卸载后，那么其下的所有的内容将不复存在。
+    tmpfs有些像虚拟磁盘（ramdisk），但不是一回事。说其像虚拟磁盘，是因为它
+可以使用你的RAM，但它也可以使用你的交换分区。传统的虚拟磁盘是一个块设
+备，而且需要一个mkfs之类的命令格式化它才能使用。tmpfs是一个独立的文件系
+统，不是块设备，只要挂接，立即就可以使用。
+    tmpfs的大下是不确定的，它最初只有很小的空间，但随着文件的复制和创建，
+它的大小就会不断变化，换句话说，它会根据你的实际需要而改变大小；tmpfs的速
+度非常惊人，毕竟它是驻留在RAM中的，即使用了交换分区，性能仍然非常卓越；
+由于tmpfs是驻留在RAM的，因此它的内容是不持久的，断电后，tmpfs的内容就消失
+了，这也是被称作tmpfs的根本原因。
+    关于tmpfs文件系统请参考linux内核文档：
+    kernel/Documentation/filesystems/tmpfs.txt
+
+2.2.2 devpts文件系统   
+    devpts文件系统为伪终端提供了一个标准接口，它的标准挂接点是/dev/pts。只要
+pty的主复合设备/dev/ptmx被打开，就会在/dev/pts下动态的创建一个新的pty设备文
+件。
+2.2.3 proc文件系统
+    proc文件系统是一个非常重要的虚拟文件系统，它可以看作是内核内部数据结构的接口，通过它我们可以获得系统的信息，同时也能够在运行时修改特定的内核参数。
+    在proc文件系统中，你可以修改内核的参数，是不是很强大？怎么修改呢?你只需要echo一个新的值到对应的文件中即可，但是如果在修改过程中发生错误的话，那么你将别无选择，只能重启设备。
+   
+    关于tmpfs文件系统请参考linux内核文档：
+    kernel/Documentation/filesystems/proc.txt
+2.2.4 sysfs文件系统
+    与proc文件系统类似，sysfs文件系统也是一个不占有任何磁盘空间的虚拟文件系
+统。它通常被挂接在/sys目录下。sysfs文件系统是Linux2.6内核引入的，它把连接在系
+统上的设备和总线组织成为一个分级的文件，使得它们可以在用户空间存取。
+
+3.屏蔽标准的输入输出，即标准的输入输出定向到NULL设备。
+    这一步是通过调用函数open_devnull_stdio实现的，下面我们研究一下open_devnull_stdio的函数实现
+void open_devnull_stdio(void)
+{
+    int fd;
+    static const char *name = "/dev/__null__";
+//创建一个字符专用文件(character special  file) /dev/__null__
+    if (mknod(name, S_IFCHR | 0600, (1 << 8) | 3) == 0) {
+//获取/dev/__null__的文件描述符，并输出该文件
+        fd = open(name, O_RDWR);
+        unlink(name);
+//将与进程相关的标准输入(0),标准输出(1),标准错误输出(2)，均定向到NULL设备
+        if (fd >= 0) {
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) {
+                close(fd);
+            }
+            return;
+        }
+    }
+
+    exit(1);
+}
+ 这里解释一下
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+过程：
+首先说明以下dup2的作用，这个函数主要是复制一个函数的描述符，一般用于重定向进程的stdin，stdout，stderr。它的原型如下：
+int dup2(int oldfd, int newfd);
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+这三次调用一次将依次代表stdin，stdout，stderr的描述符0，1，2，重定向到dev/null,通过这种方式达到屏蔽标准输入输出的作用。
+4. 初始化内核log系统
+    这个过程对应的源码为：
+log_init();
+这个函数详细实现为
+void log_init(void)
+{
+    static const char *name = "/dev/__kmsg__";
+    if (mknod(name, S_IFCHR | 0600, (1 << 8) | 11) == 0) {
+        log_fd = open(name, O_WRONLY);
+//当进程在进行exec系统调用时，要确保log_fd是关闭的(通过FD_CLOEXEC标志位来设置).
+        fcntl(log_fd, F_SETFD, FD_CLOEXEC);
+        unlink(name);
+    }
+}
+有上述实现看出内核的log输出是通过文件描述符log_fd写入的，那到底写入到什么设备呢？/dev/kmsg，这个设备则会把它收到的任何写入都作为printk的输出。printk函数是内核中运行的向控制台输出显示的函数。
+
+
+5.解析init.rc
+
+5.1 Android init language
+
+    Android init language包含四种类型语句:Actions, Commands, Services, Options。
+它的主要语法风格为:
+    1.每一个语句占据一行，所有关键字通过空格来分割。
+    2.c语言风格的反斜杠(\)将被转义为插入一个空格；
+    3.如果一个关键字含有一个或多个空格，那么怎么保证关键字完整呢？可以使用双引号来确定关键字的范围。
+    4.用于行尾的反斜杠表示续行符。
+    5.Actions和Services声明一个字段(section)，紧随其后的Commands和Options均属于这个字段，在第一个字段之前的Commands和Options的没有意义。
+    6.Actions和Services有独一无二的名字，如果Actions和Services的名字有重名，那么将被视作错误。
+
+5.1.1 Actions
+    Actions其实就是一组被命名的Commands序列。当满足触发器的事件发生时，这个action就会被置于一个队列中，这个队列存放着将要被执行的action。其格式如下：
+    on <trigger>
+          <command>
+          <command>
+          <command>
+    on是Actions的关键字，它表明下面的序列是Actions序列。
+
+5.1.2 Services
+    Services是有init进程启动的或者重新启动的程序。其格式如下：
+    service <name> <pathname> [ <argument> ]*
+          <option>
+          <option>
+
+5.1.3 Options
+    Options是Services的修饰符，由它来指定何时并且如何启动Services程序。
+
+5.1.4 Commands
+    Commands即是在满足triger条件后，Actions中执行的内容。
+
+Options和Commands的取值在这里就不描述里，有兴趣请参考system/core/rootdir/init.rc
+
+5.2 init.rc解析过程
+    我们继续回到init.c的main函数中，看init.rc的解析过程。init文件有两个init.rc和init.hardware.rc。
+
+    init_parse_config_file("/init.rc");//解析init.rc
+
+    /* pull the kernel commandline and ramdisk properties file in */
+    import_kernel_cmdline(0);//从/proc/cmdline读取内核启动参数，并保存到相应的变量中
+
+    get_hardware_name(hardware, &revision);//从/proc/cpuinfo中获取硬件信息
+    snprintf(tmp, sizeof(tmp), "/init.%s.rc", hardware);
+    init_parse_config_file(tmp);//解析硬件相关的init信息
+
+    着重介绍一下init_parse_config_file过程，这个函数负责init文件的解析。
+
+    1.首先判断关键字，只能有两种可能on或者service，通过关键字来判定section范围；
+    2.根据Actions和Services的格式对section进行逐行解析；
+    3.将解析出的内容存放到双向循环链表中。
+
+    解析过程中的双向循环链表的使用，android用到了一个非常巧妙的链表实现方法，一般情况下如果链表的节点是一个单独的数据结构的话，那么针对不同的数据结构，都需要定义不同链表操作。
+    而在初始化过程中使用到的链表则解决了这个问题，它将链表的节点定义为了一个非常精简的结构，只包含前向和后向指针，那么在定义不同的数据结构时，只需要将链表节点嵌入到数据结构中即可。
+    例如，链表节点定义如下，
+    struct listnode
+    {
+        struct listnode *next;
+        struct listnode *prev;
+    };
+
+    数据结构的定义如下，拿Action的数据结构为例，
+
+    struct action {
+        /* node in list of all actions */
+        struct listnode alist;
+        /* node in the queue of pending actions */
+        struct listnode qlist;
+        /* node in list of actions for a trigger */
+        struct listnode tlist;
+
+        unsigned hash;
+        const char *name;
+       
+        struct listnode commands;
+        struct command *current;
+    };
+
+    这样的话，所有的链表的基本操作，例如插入，删除等只会针对listnode进行操作，而不是针对特定的数据结构，如action进行操作，那么在多个数据结构使用双向链表时，链表的实现得到了统一，即精简了代码，又提高了效率。
+    但是这样的链表实现，存在一个问题，链表节点listnode中只有前向和后向指针，并且前向和后向指针均指向listnode，那么我们通过什么方式来访问数据结构action的内容呢？
+    在这里引入了一个宏offsetof，我们man一下这个宏的的定义，发现这个宏是结构体中成员变量的偏移量。这下大家心里是不是已经意识到怎么访问数据结构action了吧，对！就是计算链表节点在数据结构中的偏移量，来计算数据结构实例的地址。
+
+    Android的init过程是通过下面的宏定义来实现的，
+#define node_to_item(node, container, member) \
+    (container *) (((char*) (node)) - offsetof(container, member))
+
+    小结一下这种链表的优点：(1)所有链表基本操作都是基于listnode指针的，因此添加类型时，不需要重复写链表基本操作函数(2)一个container数据结构可以含有多个listnode成员，这样就可以同时挂到多个不同的链表中。
+
+5.3 Actions待执行队列
+    当解析完所有的init.rc内容之后，在执行这些action之前，需要按顺序将其置于一个待执行队列中，如
+        action_for_each_trigger("early-init", action_add_queue_tail);
+
+    还有一些没有在init.rc中定义的action，相比init.rc，这些action的共同点是没有参数，如
+    queue_builtin_action(wait_for_coldboot_done_action, "wait_for_coldboot_done");
+
+
+    下面我们分析一下init中的Actions待执行队列的顺序以及功能
+
+
+    action_for_each_trigger("early-init", action_add_queue_tail);
+    queue_builtin_action(wait_for_coldboot_done_action, "wait_for_coldboot_done");
+
+    queue_builtin_action(property_init_action, "property_init");
+    queue_builtin_action(keychord_init_action, "keychord_init");
+    queue_builtin_action(console_init_action, "console_init");
+    queue_builtin_action(set_init_properties_action, "set_init_properties");
+
+        /* execute all the boot actions to get us started */
+    action_for_each_trigger("init", action_add_queue_tail);
+    action_for_each_trigger("early-fs", action_add_queue_tail);
+    action_for_each_trigger("fs", action_add_queue_tail);
+    action_for_each_trigger("post-fs", action_add_queue_tail);
+
+    queue_builtin_action(property_service_init_action, "property_service_init");
+    queue_builtin_action(signal_init_action, "signal_init");
+    queue_builtin_action(check_startup_action, "check_startup");
+
+    /* execute all the boot actions to get us started */
+    action_for_each_trigger("early-boot", action_add_queue_tail);
+    action_for_each_trigger("boot", action_add_queue_tail);
+
+        /* run all property triggers based on current state of the properties */
+    queue_builtin_action(queue_property_triggers_action, "queue_propety_triggers");
+
+
+#if BOOTCHART
+    queue_builtin_action(bootchart_init_action, "bootchart_init");
+#endif   
+
+5.3.1 early-init
+    查看init.rc中的相应字符段为
+    start ueventd
+    这个action主要目的是通过early-init启动ueventd服务，这个服务负责uevent(user space event)的处理，uevent是内核向用户空间发出的一个时间通知，使应用程序能够有机会对该event做出反应。
+
+5.3.2 wait_for_coldboot_done
+    android 冷过程结束后会生成dev/.coldboot_done文件，wait_for_coldboot_done这个action会等待dev/.coldboot_done文件的生成，等待时长为5s。当然这个action不会阻塞android的冷启动过程，它会没查询一次就会休眠0.1s，直到冷启动结束。
+
+5.3.3 property_init
+    几种特殊的属性：
+    1.ro.属性，它表示只读属性，它一旦被设置就不能被修改；
+    2.net.属性，顾名思义，就是与网络相关的属性，net.属性中有一个特殊的属性：net.change，它记录了每一次最新设置和更新的net.属性，也就是每次设置和更新net.属性时则会自动的更新net.change属性，net.change属性的value就是这个被设置或者更新的net属性的name。例如我们更新了属性net.bt.name的值，由于net有属性发生了变化，那么属性服务就会自动更新net.change，将其值设置为net.bt.name。
+    3.persist.属性，以文件的形式保存在/data/property路径下。persist.属性由于将其保存在了用户空间中，所以在property_init中是不能对其更新的，只能将其更新过程交给用户来处理。
+    4.ctl.属性，虽然是以属性的形式来进行设置，其实它的目的是为了启动或关闭它指定的service
+    初始化android的属性系统，整个的过程分为下面2步
+    1.初始化属性区域(property area)，主要工作是将属性设备节点/dev/properties映射到内存空间上，将整个的属性内容作为共享内存来处理，这个共享内存就是属性区域,当前android中使用全局变量__system_property_area__来标记属性区域。
+    2.加载并设置/default.prop中定义的属性，default.prop中主要是一些“ro.”只读属性。
+
+5.3.4 keychord_init
+    这个东东不是太理解，目前的所有service均未用到这个机制。
+
+5.3.5 console_init
+    1.如果/proc/cmdline指定了控制台终端，那么优先使用这个控制台，如果没有指定，那么将使用默认控制台终端/dev/console。
+    2.加载开机图片,参考load_565rle_image函数
+    a,通过ioctl函数修改dev/tty0(即终端控制台)为图像显示模式；
+    b,尝试打开/initlogo.rle,如果失败，那么将dev/tty0恢复为文本显示模式，则开机时显示"ANDROID"文字；
+    c,如果打开/initlogo.rle成功，那么init将会打开Framebuffer，下面我们分析一下这个过程
+        //logo.c
+        static int fb_open(struct FB *fb)
+        {
+            //打开Framebuffer对应的设备文件/dev/graphics/fb0   
+            fb->fd = open("/dev/graphics/fb0", O_RDWR);
+            if (fb->fd < 0)
+            return -1;
+            //通过ioctl函数获得Framebuffer相关信息
+            //FBIOGET_FSCREENINFO对应的是Framebuffer的固定信息
+            //FBIOGET_VSCREENINFO对应的是Framebuffer的可变信息   
+            if (ioctl(fb->fd, FBIOGET_FSCREENINFO, &fb->fi) < 0)
+            goto fail;
+            if (ioctl(fb->fd, FBIOGET_VSCREENINFO, &fb->vi) < 0)
+            goto fail;
+            //由于Framebuffer是可以被用户直接读写的，所以需要将/dev/graphics/fb0映射到用户空间的内存区。
+            fb->bits = mmap(0, fb_size(fb), PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fb->fd, 0);
+            if (fb->bits == MAP_FAILED)
+            goto fail;
+
+            return 0;
+
+        fail:
+            close(fb->fd);
+            return -1;
+        }
+        d,将initlogo.rle数据写到Framebuffer中。
+
+    目前android默认是没有initlogo.rle，如果想自己添加开机图片的话，具体过程请参考http://www.cnmsdn.com/html/201005/1274855679ID5109.html
+
+5.3.6 set_init_properties
+    设置与硬件载频相关的只读属性。
+
+5.3.7 init
+    执行init.rc中init action字段中定义的处理。init.rc中的actions就不再一一分析了，有兴趣或者有时间在分析。
+
+5.3.8 property_service_init
+    1.读取/system/build.prop，/system/default.prop， /data/local.prop以及/data/property/下的属性并将其设置；
+    2.创建一个服务器端UNIX Domain Socket，它的socket文件路径为/dev/socket/property_service，这个socket监听来自客户端的属性修改请求.
+
+5.3.9 signal_init
+    1.
+    2.通过socketpair创建一对已连接的socket，将生成的两个socket设置为O_NONBLOCK模式，也就是将对socket句柄的读写操作设置为非阻塞模式。
+
+
+5.3.10 check_startup
+    确保5.3.8中属性设置socket文件描述符和signal_init中signal socket文件描述符，如果两个有其一不存在，那么将退出系统。
+
+5.3.11 boot
+    boot action主要由两部分组成，
+    1. 还是一些配置性的工作，例如基本的网络配置；ActivityManagerService中用到的进程管理和资源回收时，需要用到的优先级变量的设置等。
+    2. 启动所有init.rc声明的未指定class的service；
+    具体的command为 class_start default。
+    在解析init.rc时，如果service未指定class选项的话，那么会给它的classname默认的指定为“default”，而目前的init.rc中的所有的service均未指定class选项，所以命令“class_start default”将按顺序启动所有的service。
+    也可以为需要一起启动，一起关闭的services指定一个相同的class，那么就可以对这些service进行统一处理了。
+    还需注意：如果service中定义了disabled选项，那么不能通过class_start来启动它，只能显示的一个一个的启动。被disabled修饰的service一般是在
+
+5.3.12 queue_propety_triggers
+    根据init.rc中action指定的property值与属性中的值比较，如果相等则执行对应的command。例如
+    on property:ro.secure=0
+        start console
+    如果当前ro.secure的值为0，那么启动console服务
+
+5.3.13 bootchart_init
+    Bootchart 能够对系统的性能进行分析，并生成系统启动过程的图表，以便为你提供有价值的参考信息。综合所得的信息，你就可以进行相应的改进，从而加快你的 Linux 系统启动过程。
+    如果设置了Bootchart，则该过程初始化Bootchart。
+
+5.4 init轮询过程
+    以上部分将所有需要操作的action均放在了action待执行队列中，那么init进程将要进入一个死循环过程，整个android的将会运行在这个生命周期内。
+
+    1.执行action待执行队列中的所有command；
+    2.重启所有需要重启的service；
+    3.注册属性设置property_set_fd，信号signal处理signal_recv_fd，keychord keychord_fd三个文件描述符的为轮询对象。
+    if (!property_set_fd_init && get_property_set_fd() > 0) {
+            ufds[fd_count].fd = get_property_set_fd();
+            ufds[fd_count].events = POLLIN;
+            ufds[fd_count].revents = 0;
+            fd_count++;
+            property_set_fd_init = 1;
+        }
+        if (!signal_fd_init && get_signal_fd() > 0) {
+            ufds[fd_count].fd = get_signal_fd();
+            ufds[fd_count].events = POLLIN;
+            ufds[fd_count].revents = 0;
+            fd_count++;
+            signal_fd_init = 1;
+        }
+        if (!keychord_fd_init && get_keychord_fd() > 0) {
+            ufds[fd_count].fd = get_keychord_fd();
+            ufds[fd_count].events = POLLIN;
+            ufds[fd_count].revents = 0;
+            fd_count++;
+            keychord_fd_init = 1;
+        }
+   
+    有以上代码可见，init进程将三个描述符均定义为了POLLIN事件响应，当描述符有可读数据时，对于socket描述符，有连接请求时ufds就会收到POLLIN事件。
+
+   
+    4.下面分别对这3个文件描述符的轮询过程作简单的介绍
+        nr = poll(ufds, fd_count, timeout);
+        if (nr <= 0)
+            continue;
+
+        for (i = 0; i < fd_count; i++) {
+            if (ufds[i].revents == POLLIN) {
+                if (ufds[i].fd == get_property_set_fd())
+                    handle_property_set_fd();
+                else if (ufds[i].fd == get_keychord_fd())
+                    handle_keychord();
+                else if (ufds[i].fd == get_signal_fd())
+                    handle_signal();
+            }
+        }
+    上面的代码为轮询的总体体现，当有POLLIN事件发生时，相应的ufds[i].revents就会被置为POLLIN，然后执行各自的handler
+    A，property_set_fd
+    收到属性设置的socket请求之后，设置相关属性。            
+
+    B，signal_recv_fd
+    当有子进程终止时，也就是service终止时，内核会给init发送SIGCHLD，此时调用注册的handler函数
+    static void sigchld_handler(int s)
+    {
+        write(signal_fd, &s, 1);
+    }
+        这个handler函数是向其中的一个socket signal_fd写入数据，由于signal_init过程中初始化了一对已连接的socket signal_fd和signal_recv_fd，因此此时signal_recv_fd会收到向signal_fd写入的数据，然后查询那个service终止，然后根据该service的属性来作相关的操作，是重启还是结束进行资源回收。
+
+    C，keychord_fd
+    目前的init过程中没有service执行keychord机制。
